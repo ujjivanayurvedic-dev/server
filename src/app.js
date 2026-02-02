@@ -22,8 +22,7 @@ app.use(cookieParser());
 
 const allowedOrigins = new Set([
   "http://localhost:5173",
-  "https://king-frontend-mu.vercel.app",
-  "https://new-king-six.vercel.app"
+  "https://www.sattakingresult.info"
 ]);
 
 app.use(
