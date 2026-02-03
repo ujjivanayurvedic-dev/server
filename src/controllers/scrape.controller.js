@@ -3,7 +3,8 @@ const ScrapeResult = require("../models/scrapeResult.model");
 
 // ---------------- CORE SCRAPER ----------------
 const performScrapingTask = async () => {
-  console.log(`⏳ Scraping started: ${new Date().toLocaleString("en-IN")}`);
+  const startTime = Date.now();
+  console.log(`⏳ Scraping started at ${new Date().toISOString()}`);
 
   try {
     const { data: html } = await axios.get("https://jksatta.com/", {
@@ -20,7 +21,7 @@ const performScrapingTask = async () => {
     const startYear = 2026;
 
     const bulkOps = [];
-    const responseData = [];
+    let totalRecords = 0;
 
     for (const gameId in record) {
       for (const dateKey in record[gameId]) {
@@ -38,8 +39,6 @@ const performScrapingTask = async () => {
             resultNumber: entry.no,
           };
 
-          responseData.push(payload);
-
           bulkOps.push({
             updateOne: {
               filter: { gameId, date: entry.date },
@@ -47,6 +46,8 @@ const performScrapingTask = async () => {
               upsert: true,
             },
           });
+
+          totalRecords++;
         }
       }
     }
@@ -55,11 +56,13 @@ const performScrapingTask = async () => {
       await ScrapeResult.bulkWrite(bulkOps, { ordered: false });
     }
 
-    responseData.sort((a, b) => b.isoDate - a.isoDate);
+    console.log(
+      `✅ Scrape completed | Records: ${totalRecords} | Time: ${
+        Date.now() - startTime
+      }ms`
+    );
 
-    console.log(`✅ Scrape completed: ${responseData.length} records`);
-    return { success: true, totalFound: responseData.length };
-
+    return { success: true, totalRecords };
   } catch (error) {
     console.error("❌ Scrape failed:", error.message);
     return { success: false, message: error.message };
@@ -69,24 +72,21 @@ const performScrapingTask = async () => {
 // ---------------- API CONTROLLER ----------------
 const scrapeJKSattaAllMonths = async (req, res) => {
   try {
-    // 🔐 SECURITY CHECK
+    // 🔐 SECURITY
     const secret = req.headers["x-scrape-secret"];
     if (secret !== process.env.SCRAPE_SECRET) {
-      return res.status(401).json({ message: "Unauthorized" });
+      return res.status(401).send("Unauthorized");
     }
 
-    const result = await performScrapingTask();
+    // ✅ Respond immediately (cron safe)
+    res.status(200).send("SCRAPE STARTED");
 
-    if (!result.success) {
-      return res.status(500).json(result);
-    }
-
-    res.json(result);
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: error.message,
+    // ✅ Run scrape in background
+    setImmediate(async () => {
+      await performScrapingTask();
     });
+  } catch (error) {
+    console.error("Controller error:", error.message);
   }
 };
 
