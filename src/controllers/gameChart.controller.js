@@ -25,25 +25,46 @@ const getIndianDates = () => {
 };
 
 // ============================================================================
-// 1️⃣ GET FULL CHART (For the Big Monthly Table)
-// Logic: Fetches entire history so the table can show past months/years.
+// 1️⃣ GET FULL CHART (OPTIMIZED WITH PAGINATION)
 // ============================================================================
 exports.getFullChart = async (req, res) => {
   try {
-    // Cache Control: Public cache for 30s (Table doesn't change every second)
-    res.set('Cache-Control', 'public, max-age=30, must-revalidate');
+    const { page = 1, limit = 50, month, year } = req.query;
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const skip = (pageNum - 1) * limitNum;
 
-    // 1. Fetch ALL data (Sorted by Date)
+    // Build date filter if month/year specified
+    const dateFilter = {};
+    if (month && year) {
+      const startDate = new Date(year, month - 1, 1);
+      const endDate = new Date(year, month, 0);
+      dateFilter.isoDate = { $gte: startDate, $lte: endDate };
+    }
+
+    // Cache Control: Public cache for 30s
+    res.set('Cache-Control', 'public, max-age=30');
+
+    // 1. Count total documents first
+    const [totalScrape, totalNoida] = await Promise.all([
+      ScrapeResult.countDocuments(dateFilter),
+      DateNumber.countDocuments(dateFilter)
+    ]);
+
+    // 2. Fetch paginated data with projection
     const [scrapeData, noidaData] = await Promise.all([
-      ScrapeResult.find({}, "gameId date resultNumber isoDate createdAt")
-        .sort({ isoDate: 1 })
+      ScrapeResult.find(dateFilter, "gameId date resultNumber isoDate")
+        .sort({ isoDate: -1 }) // Newest first for pagination
+        .skip(skip)
+        .limit(limitNum)
         .lean(),
-      DateNumber.find({}, "date number isoDate createdAt")
-        .sort({ isoDate: 1 })
+      DateNumber.find(dateFilter, "date number isoDate")
+        .sort({ isoDate: -1 })
+        .skip(skip)
+        .limit(limitNum)
         .lean(),
     ]);
 
-    const map = new Map();
     const GAME_MAP = {
       "116": "DESAWAR",
       "127": "SHRI GANESH",
@@ -53,46 +74,52 @@ exports.getFullChart = async (req, res) => {
       "117": "FARIDABAD",
     };
 
-    // Helper to initialize row
-    const getOrCreateRow = (date, isoDate) => {
-      if (!map.has(date)) {
-        map.set(date, { 
+    // 3. Efficient Map for grouping
+    const dateMap = new Map();
+
+    // Process Scrape Data
+    scrapeData.forEach(({ gameId, date, resultNumber, isoDate }) => {
+      const name = GAME_MAP[gameId];
+      if (!name || !date) return;
+      
+      if (!dateMap.has(date)) {
+        dateMap.set(date, { 
           date, 
-          timestamp: isoDate ? new Date(isoDate).getTime() : 0, 
+          isoDate: isoDate?.getTime() || 0,
           games: {} 
         });
       }
-      return map.get(date);
-    };
-
-    // 2. Process Scrape Data
-    scrapeData.forEach(({ gameId, date, resultNumber, createdAt, isoDate }) => {
-      const name = GAME_MAP[gameId];
-      if (name && date) {
-        const row = getOrCreateRow(date, isoDate);
-        row.games[name] = { 
-          result: String(resultNumber), 
-          createdAt 
-        };
-      }
+      dateMap.get(date).games[name] = { result: String(resultNumber) };
     });
 
-    // 3. Process Noida Data
-    noidaData.forEach(({ date, number, createdAt, isoDate }) => {
-      if (date) {
-        const row = getOrCreateRow(date, isoDate);
-        row.games["NOIDA KING"] = { 
-          result: String(number), 
-          createdAt 
-        };
+    // Process Noida Data
+    noidaData.forEach(({ date, number, isoDate }) => {
+      if (!date) return;
+      
+      if (!dateMap.has(date)) {
+        dateMap.set(date, { 
+          date, 
+          isoDate: isoDate?.getTime() || 0,
+          games: {} 
+        });
       }
+      dateMap.get(date).games["NOIDA KING"] = { result: String(number) };
     });
 
-    // 4. Sort by Date & Clean Output
-    const rows = Array.from(map.values()).sort((a, b) => a.timestamp - b.timestamp);
-    const cleanedRows = rows.map(({ timestamp, ...rest }) => rest);
+    // 4. Convert to array and sort
+    const rows = Array.from(dateMap.values())
+      .sort((a, b) => b.isoDate - a.isoDate); // Descending (newest first)
 
-    res.json({ success: true, data: cleanedRows });
+    res.json({ 
+      success: true, 
+      data: rows,
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total: Math.max(totalScrape, totalNoida),
+        totalPages: Math.ceil(Math.max(totalScrape, totalNoida) / limitNum)
+      }
+    });
 
   } catch (err) {
     console.error("Full Chart Error:", err);
@@ -101,25 +128,13 @@ exports.getFullChart = async (req, res) => {
 };
 
 // ============================================================================
-// 2️⃣ GET LIVE CARDS (Only Yesterday & Today)
-// Logic: Very fast, lightweight query for the dashboard cards.
+// 2️⃣ GET LIVE CARDS (Optimized with single query)
 // ============================================================================
 exports.getTwoDayLive = async (req, res) => {
   try {
-    // No Cache: Live results must update instantly
     res.set('Cache-Control', 'no-store, max-age=0');
-
     const { todayStr, yesterdayStr } = getIndianDates();
-    const targetDates = [todayStr, yesterdayStr];
 
-    // 1. Query only specific dates
-    const [scrapeData, noidaData] = await Promise.all([
-      ScrapeResult.find({ date: { $in: targetDates } }).lean(),
-      DateNumber.find({ date: { $in: targetDates } }).lean()
-    ]);
-
-    const data = [];
-    const map = new Map();
     const GAME_MAP = {
       "116": "DESAWAR",
       "127": "SHRI GANESH",
@@ -129,25 +144,60 @@ exports.getTwoDayLive = async (req, res) => {
       "117": "FARIDABAD",
     };
 
-    const processItem = (date, gameName, result) => {
-      if (!map.has(date)) {
-        const entry = { date, games: {} };
-        map.set(date, entry);
-        data.push(entry);
-      }
-      map.get(date).games[gameName] = { result: String(result) };
+    // 1. Fetch results for both days
+    const [scrapeResults, noidaResults] = await Promise.all([
+      ScrapeResult.find({ date: { $in: [todayStr, yesterdayStr] } }).lean(),
+      DateNumber.find({ date: { $in: [todayStr, yesterdayStr] } }).lean()
+    ]);
+
+    // 2. Helper to format time to IST (HH:MM AM/PM)
+    const formatISTTime = (date) => {
+      if (!date) return null;
+      return new Date(date).toLocaleTimeString('en-IN', {
+        timeZone: 'Asia/Kolkata',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: true
+      });
     };
 
-    scrapeData.forEach(item => {
-      const name = GAME_MAP[item.gameId];
-      if (name) processItem(item.date, name, item.resultNumber);
-    });
+    // 3. Helper to build the daily object
+    const buildDayObject = (targetDate) => {
+      const dayData = { date: targetDate, games: {} };
 
-    noidaData.forEach(item => {
-      processItem(item.date, "NOIDA KING", item.number);
-    });
+      // Process Scraped Games
+      scrapeResults
+        .filter(item => item.date === targetDate)
+        .forEach(item => {
+          const gameName = GAME_MAP[item.gameId];
+          if (gameName) {
+            dayData.games[gameName] = { 
+              result: String(item.resultNumber),
+              time: formatISTTime(item.createdAt) // Added Time
+            };
+          }
+        });
 
-    res.json({ success: true, data: data });
+      // Process Noida King
+      const noidaEntry = noidaResults.find(item => item.date === targetDate);
+      if (noidaEntry) {
+        dayData.games["NOIDA KING"] = { 
+          result: String(noidaEntry.number),
+          time: formatISTTime(noidaEntry.createdAt) // Added Time
+        };
+      }
+
+      return dayData;
+    };
+
+    const todayObj = buildDayObject(todayStr);
+    const yesterdayObj = buildDayObject(yesterdayStr);
+
+    res.json({
+      success: true,
+      hasTodayData: Object.keys(todayObj.games).length > 0,
+      data: [todayObj, yesterdayObj]
+    });
 
   } catch (err) {
     console.error("Live Card Error:", err);
@@ -156,72 +206,92 @@ exports.getTwoDayLive = async (req, res) => {
 };
 
 // ============================================================================
-// 3️⃣ GET RECENT WIDGET (Top 3 Results of Today)
-// Logic: Only Today's data, Sorted by time (Newest First).
+// 3️⃣ GET RECENT WIDGET (Optimized with single aggregation)
 // ============================================================================
 exports.getTopRecent = async (req, res) => {
   try {
     res.set('Cache-Control', 'no-store'); 
     
     const { todayStr } = getIndianDates();
+    const now = Date.now();
+    const threeHoursAgo = now - (3 * 60 * 60 * 1000);
 
-    // 1. Fetch ONLY Today's data
-    const [scrapeData, noidaData] = await Promise.all([
-      ScrapeResult.find({ date: todayStr }).lean(),
-      DateNumber.find({ date: todayStr }).lean()
+    // Single aggregation for scrape results
+    const scrapeAggregation = await ScrapeResult.aggregate([
+      { 
+        $match: { 
+          date: todayStr,
+          createdAt: { $gte: new Date(threeHoursAgo) }
+        } 
+      },
+      { 
+        $sort: { createdAt: -1 } 
+      },
+      { 
+        $limit: 7 
+      },
+      {
+        $project: {
+          name: {
+            $switch: {
+              branches: [
+                { case: { $eq: ["$gameId", "116"] }, then: "DESAWAR" },
+                { case: { $eq: ["$gameId", "127"] }, then: "SHRI GANESH" },
+                { case: { $eq: ["$gameId", "126"] }, then: "DELHI BAZAR" },
+                { case: { $eq: ["$gameId", "120"] }, then: "GALI" },
+                { case: { $eq: ["$gameId", "119"] }, then: "GHAZIABAD" },
+                { case: { $eq: ["$gameId", "117"] }, then: "FARIDABAD" },
+              ],
+              default: null
+            }
+          },
+          result: "$resultNumber",
+          timestamp: { $toLong: "$createdAt" }
+        }
+      },
+      {
+        $match: {
+          name: { $ne: null }
+        }
+      }
     ]);
 
-    const results = [];
-    const GAME_MAP = {
-      "116": "DESAWAR",
-      "127": "SHRI GANESH",
-      "126": "DELHI BAZAR",
-      "120": "GALI",
-      "119": "GHAZIABAD",
-      "117": "FARIDABAD",
-    };
+    // Get noida data
+    const noidaData = await DateNumber.findOne({ 
+      date: todayStr,
+      createdAt: { $gte: new Date(threeHoursAgo) }
+    }).sort({ createdAt: -1 });
 
-    // 2. Flatten data for sorting
-    scrapeData.forEach(item => {
-      if (GAME_MAP[item.gameId] && item.resultNumber) {
-        results.push({
-          name: GAME_MAP[item.gameId],
-          result: String(item.resultNumber),
-          timestamp: new Date(item.createdAt).getTime()
-        });
-      }
-    });
+    // Combine and sort
+    const allResults = [...scrapeAggregation];
+    if (noidaData) {
+      allResults.push({
+        name: "NOIDA KING",
+        result: String(noidaData.number),
+        timestamp: noidaData.createdAt.getTime()
+      });
+    }
 
-    noidaData.forEach(item => {
-      if (item.number) {
-        results.push({
-          name: "NOIDA KING",
-          result: String(item.number),
-          timestamp: new Date(item.createdAt).getTime()
-        });
-      }
-    });
+    // Sort and take top 3
+    allResults.sort((a, b) => b.timestamp - a.timestamp);
+    const topThree = allResults.slice(0, 3);
 
-    // 3. Sort by Time (Newest First) & Slice Top 3
-    results.sort((a, b) => b.timestamp - a.timestamp);
-    const topThree = results.slice(0, 3);
-
-    // 4. Format for Frontend
+    // Format response
     const gamesObject = {};
     topThree.forEach(item => {
-        gamesObject[item.name] = { 
-            result: item.result, 
-            timestamp: item.timestamp 
-        };
+      gamesObject[item.name] = { 
+        result: item.result, 
+        timestamp: item.timestamp 
+      };
     });
 
-    // Return array with single "Today" object containing top 3 games
-    const responseData = [{
+    res.json({ 
+      success: true, 
+      data: [{
         date: todayStr,
         games: gamesObject
-    }];
-
-    res.json({ success: true, data: responseData });
+      }] 
+    });
 
   } catch (err) {
     console.error("Recent Widget Error:", err);
