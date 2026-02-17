@@ -29,39 +29,32 @@ const getIndianDates = () => {
 // ============================================================================
 exports.getFullChart = async (req, res) => {
   try {
-    const { page = 1, limit = 50, month, year } = req.query;
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-    const skip = (pageNum - 1) * limitNum;
+    const { month, year } = req.query;
 
-    // Build date filter if month/year specified
     const dateFilter = {};
+
+    // 📅 If month & year provided → fetch full month
     if (month && year) {
       const startDate = new Date(year, month - 1, 1);
-      const endDate = new Date(year, month, 0);
-      dateFilter.isoDate = { $gte: startDate, $lte: endDate };
+      const endDate = new Date(year, month, 0, 23, 59, 59, 999);
+
+      dateFilter.isoDate = {
+        $gte: startDate,
+        $lte: endDate,
+      };
     }
 
-    // Cache Control: Public cache for 30s
-    res.set('Cache-Control', 'public, max-age=30');
+    // Disable caching
+    res.set("Cache-Control", "no-store");
 
-    // 1. Count total documents first
-    const [totalScrape, totalNoida] = await Promise.all([
-      ScrapeResult.countDocuments(dateFilter),
-      DateNumber.countDocuments(dateFilter)
-    ]);
-
-    // 2. Fetch paginated data with projection
+    // 🔥 Fetch ALL data (No pagination)
     const [scrapeData, noidaData] = await Promise.all([
       ScrapeResult.find(dateFilter, "gameId date resultNumber isoDate")
-        .sort({ isoDate: -1 }) // Newest first for pagination
-        .skip(skip)
-        .limit(limitNum)
+        .sort({ isoDate: -1 })
         .lean(),
+
       DateNumber.find(dateFilter, "date number isoDate")
         .sort({ isoDate: -1 })
-        .skip(skip)
-        .limit(limitNum)
         .lean(),
     ]);
 
@@ -74,58 +67,63 @@ exports.getFullChart = async (req, res) => {
       "117": "FARIDABAD",
     };
 
-    // 3. Efficient Map for grouping
     const dateMap = new Map();
 
-    // Process Scrape Data
+    // 🟢 Process Scrape Data
     scrapeData.forEach(({ gameId, date, resultNumber, isoDate }) => {
-      const name = GAME_MAP[gameId];
-      if (!name || !date) return;
-      
+      const gameName = GAME_MAP[gameId];
+      if (!gameName || !date) return;
+
       if (!dateMap.has(date)) {
-        dateMap.set(date, { 
-          date, 
+        dateMap.set(date, {
+          date,
           isoDate: isoDate?.getTime() || 0,
-          games: {} 
+          games: {},
         });
       }
-      dateMap.get(date).games[name] = { result: String(resultNumber) };
+
+      dateMap.get(date).games[gameName] = {
+        result: String(resultNumber),
+      };
     });
 
-    // Process Noida Data
+    // 🟢 Process Noida Data
     noidaData.forEach(({ date, number, isoDate }) => {
       if (!date) return;
-      
+
       if (!dateMap.has(date)) {
-        dateMap.set(date, { 
-          date, 
+        dateMap.set(date, {
+          date,
           isoDate: isoDate?.getTime() || 0,
-          games: {} 
+          games: {},
         });
       }
-      dateMap.get(date).games["NOIDA KING"] = { result: String(number) };
+
+      dateMap.get(date).games["NOIDA KING"] = {
+        result: String(number),
+      };
     });
 
-    // 4. Convert to array and sort
-    const rows = Array.from(dateMap.values())
-      .sort((a, b) => b.isoDate - a.isoDate); // Descending (newest first)
+    // 🔥 Convert Map → Array & Sort
+    const rows = Array.from(dateMap.values()).sort(
+      (a, b) => b.isoDate - a.isoDate
+    );
 
-    res.json({ 
-      success: true, 
+    res.json({
+      success: true,
+      totalDays: rows.length,
       data: rows,
-      pagination: {
-        page: pageNum,
-        limit: limitNum,
-        total: Math.max(totalScrape, totalNoida),
-        totalPages: Math.ceil(Math.max(totalScrape, totalNoida) / limitNum)
-      }
     });
 
   } catch (err) {
     console.error("Full Chart Error:", err);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 };
+
 
 // ============================================================================
 // 2️⃣ GET LIVE CARDS (Optimized with single query)
