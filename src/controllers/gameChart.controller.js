@@ -29,12 +29,17 @@ const getIndianDates = () => {
 // ============================================================================
 exports.getFullChart = async (req, res) => {
   try {
-    const { month, year } = req.query;
-
+    const { month, year, since } = req.query;
+    const syncTimestamp = Date.now();
     const dateFilter = {};
 
-    // 📅 If month & year provided → fetch full month
-    if (month && year) {
+    // 🔄 DELTA SYNC OPTIMIZATION
+    // If 'since' is provided, only fetch records updated after that timestamp.
+    if (since && !isNaN(since)) {
+      dateFilter.updatedAt = { $gt: new Date(parseInt(since)) };
+    } 
+    // 📅 Existing month & year filter
+    else if (month && year) {
       const startDate = new Date(year, month - 1, 1);
       const endDate = new Date(year, month, 0, 23, 59, 59, 999);
 
@@ -44,16 +49,22 @@ exports.getFullChart = async (req, res) => {
       };
     }
 
-    // Disable caching
-    res.set("Cache-Control", "no-store");
+    // Optimize headers: Leverage Edge Caching (CDNs) for high production performance.
+    if (since) {
+      // Delta syncs are unique per timestamp, short cache is fine.
+      res.set("Cache-Control", "public, max-age=30, s-maxage=30, stale-while-revalidate=60");
+    } else {
+      // Main chart endpoint - allow edge to cache for 30s, but client to revalidate.
+      res.set("Cache-Control", "public, s-maxage=30, stale-while-revalidate=120");
+    }
 
-    // 🔥 Fetch ALL data (No pagination)
+    // 🔥 Fetch data (Optimized Projection)
     const [scrapeData, noidaData] = await Promise.all([
-      ScrapeResult.find(dateFilter, "gameId date resultNumber isoDate")
+      ScrapeResult.find(dateFilter, "gameId date resultNumber isoDate updatedAt")
         .sort({ isoDate: -1 })
         .lean(),
 
-      DateNumber.find(dateFilter, "date number isoDate")
+      DateNumber.find(dateFilter, "date number isoDate updatedAt")
         .sort({ isoDate: -1 })
         .lean(),
     ]);
@@ -111,8 +122,10 @@ exports.getFullChart = async (req, res) => {
 
     res.json({
       success: true,
+      delta: !!since,
       totalDays: rows.length,
       data: rows,
+      syncTimestamp, // Used by frontend for next 'since' call
     });
 
   } catch (err) {
@@ -130,7 +143,10 @@ exports.getFullChart = async (req, res) => {
 // ============================================================================
 exports.getTwoDayLive = async (req, res) => {
   try {
-    res.set('Cache-Control', 'no-store, max-age=0');
+    // 🌍 PRODUCTION OPTIMIZATION: CDN Edge Caching
+    // Use stale-while-revalidate to ensure users always get a fast response
+    // while the CDN updates in the background.
+    res.set('Cache-Control', 'public, s-maxage=20, stale-while-revalidate=40');
     const { todayStr, yesterdayStr } = getIndianDates();
 
     const GAME_MAP = {
@@ -208,7 +224,8 @@ exports.getTwoDayLive = async (req, res) => {
 // ============================================================================
 exports.getTopRecent = async (req, res) => {
   try {
-    res.set('Cache-Control', 'no-store'); 
+    // 🌍 High-frequency endpoint: Cache at edge for 10s
+    res.set('Cache-Control', 'public, s-maxage=10, stale-while-revalidate=30'); 
     
     const { todayStr } = getIndianDates();
     const now = Date.now();
