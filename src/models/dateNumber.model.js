@@ -20,7 +20,7 @@ const dateNumberSchema = new mongoose.Schema(
       min: 0 // Basic integrity check
     },
   },
-  { timestamps: true }
+  { timestamps: { index: true } }
 );
 
 // Pre-save hook for efficient sorting data

@@ -22,7 +22,7 @@ const scrapeResultSchema = new mongoose.Schema(
       required: true,
     },
   },
-  { timestamps: true }
+  { timestamps: { index: true } }
 );
 
 // 🔥 COMPOUND INDEX OPTIMIZATION
